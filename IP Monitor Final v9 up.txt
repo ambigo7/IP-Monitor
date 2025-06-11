@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# === CONFIG ===
+declare -A TARGETS
+
+TARGETS["8.8.8.8"]="GoogleDNS1"
+TARGETS["8.8.4.4"]="GoogleDNS2"
+TARGETS["1.1.1.2"]="CloudFlare"
+
+LOG_DIR="/var/log/ip-monitor"
+STATUS_DIR="$LOG_DIR/status"
+TELEGRAM_BOT_TOKEN="YOUR_BOT_TOKEN"
+TELEGRAM_CHAT_ID="YOUR_CHAT_ID"
+RETENTION_DAYS=7
+MTR_SHORT_LINES=15
+PING_COUNT=10
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+send_telegram() {
+    local message="$1"
+    curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+         -d chat_id="$TELEGRAM_CHAT_ID" \
+         -d parse_mode="Markdown" \
+         -d text="$message"
+}
+
+get_status_file() {
+    local ip=$1
+    echo "$STATUS_DIR/status-${ip//./_}.flag"
+}
+
+extract_packet_loss() {
+    local ip=$1
+    local debug_file="$LOG_DIR/debug.log"
+    local ping_output packet_loss
+
+    ping_output=$(ping -c $PING_COUNT -W 2 "$ip" 2>&1)
+
+    echo "[DEBUG][$(date '+%Y-%m-%d %H:%M:%S')] Ping output for $ip:" >> "$debug_file"
+    echo "$ping_output" >> "$debug_file"
+
+    packet_loss=$(echo "$ping_output" | awk -F',' '/packet loss/ {gsub(/ /, "", $3); print $3}' | cut -d% -f1)
+    echo "[DEBUG][$(date '+%Y-%m-%d %H:%M:%S')] Parsed packet loss for $ip = ${packet_loss:-EMPTY}" >> "$debug_file"
+    echo "------" >> "$debug_file"
+
+    [[ -z "$packet_loss" ]] && echo "100" || echo "$packet_loss"
+}
+
+cleanup_logs() {
+    echo "[$(date)] Running weekly log cleanup" >> "$LOG_DIR/cleanup.log"
+    find "$LOG_DIR" -name "mtr-*.log" -type f -mtime +$RETENTION_DAYS -exec rm -f {} \;
+    find "$LOG_DIR" -type f \( -name "downtime.log" -o -name "degraded.log" -o -name "uptime.log" \) -mtime +$RETENTION_DAYS -exec rm -f {} \;
+
+    if [ -f "$LOG_DIR/debug.log" ]; then
+        if [ "$(find "$LOG_DIR/debug.log" -mtime +$RETENTION_DAYS 2>/dev/null | wc -l)" -gt 0 ]; then
+            rm -f "$LOG_DIR/debug.log"
+            echo "[$(date)] Removed old debug.log" >> "$LOG_DIR/cleanup.log"
+        elif [ "$(stat -c%s "$LOG_DIR/debug.log")" -gt 10485760 ]; then
+            : > "$LOG_DIR/debug.log"
+            echo "[$(date)] Truncated large debug.log (>10MB)" >> "$LOG_DIR/cleanup.log"
+        fi
+    fi
+    echo "[$(date)] Log cleanup done." >> "$LOG_DIR/cleanup.log"
+}
+
+mkdir -p "$LOG_DIR" "$STATUS_DIR"
+
+declare -A PACKET_LOSS_RESULTS
+TMP_RESULT_FILE="/tmp/packet_loss_results_$$.tmp"
+: > "$TMP_RESULT_FILE"
+
+for TARGET_IP in "${!TARGETS[@]}"; do
+    {
+        LOSS=$(extract_packet_loss "$TARGET_IP")
+        echo "$TARGET_IP:$LOSS" >> "$TMP_RESULT_FILE"
+    } &
+done
+wait
+
+while IFS=: read -r ip loss; do
+    PACKET_LOSS_RESULTS["$ip"]="$loss"
+done < "$TMP_RESULT_FILE"
+rm -f "$TMP_RESULT_FILE"
+
+for TARGET_IP in "${!PACKET_LOSS_RESULTS[@]}"; do
+    echo "[CHECK] $TARGET_IP loss=${PACKET_LOSS_RESULTS[$TARGET_IP]}" >> "$LOG_DIR/debug.log"
+done
+
+for TARGET_IP in "${!TARGETS[@]}"; do
+    TARGET_NAME="${TARGETS[$TARGET_IP]}"
+    NOW=$(date +"%Y-%m-%d %H:%M:%S")
+    NOW_TS=$(date +%s)
+    STATUS_FILE=$(get_status_file "$TARGET_IP")
+    PACKET_LOSS="${PACKET_LOSS_RESULTS[$TARGET_IP]}"
+
+    if [[ -z "$PACKET_LOSS" || "$PACKET_LOSS" -eq 100 ]]; then
+        CURRENT_STATE="DOWN"
+    elif [[ "$PACKET_LOSS" -eq 0 ]]; then
+        CURRENT_STATE="UP"
+    elif (( PACKET_LOSS >= 20 )); then
+        CURRENT_STATE="DEGRADED"
+    else
+        CURRENT_STATE="UP"
+    fi
+
+    if [ -f "$STATUS_FILE" ]; then
+        read -r PREV_STATE PREV_TIMESTAMP PREV_LOSS < "$STATUS_FILE"
+    else
+        PREV_STATE="UNKNOWN"
+        PREV_TIMESTAMP="$NOW_TS"
+        PREV_LOSS=0
+    fi
+
+    if [[ "$CURRENT_STATE" == "DOWN" ]]; then
+        echo "[$NOW] $TARGET_NAME ($TARGET_IP) is DOWN" >> "$LOG_DIR/downtime.log"
+        MTR_FILE="$LOG_DIR/mtr-${TARGET_IP//./_}-$(date +%Y%m%d-%H%M%S).log"
+        timeout 15 mtr --report --report-cycles 5 --no-dns $TARGET_IP > "$MTR_FILE"
+        MTR_SNIPPET=$(head -n $MTR_SHORT_LINES "$MTR_FILE" | sed 's/`/ /g')
+
+        if [[ "$PREV_STATE" != "DOWN" ]]; then
+            TELEGRAM_MSG="🚨 *ALERT*: *$TARGET_NAME* \`$TARGET_IP\` is *DOWN*
+🕒 Time: \`$NOW\`
+
+*MTR Snapshot:*
+\`\`\`
+$MTR_SNIPPET
+\`\`\`"
+            send_telegram "$TELEGRAM_MSG"
+            echo "DOWN $NOW_TS 100" > "$STATUS_FILE"
+        fi
+
+    elif [[ "$CURRENT_STATE" == "DEGRADED" ]]; then
+        echo "[$NOW] $TARGET_NAME ($TARGET_IP) is DEGRADED (${PACKET_LOSS}% loss)" >> "$LOG_DIR/degraded.log"
+
+        if [[ "$PREV_STATE" != "DEGRADED" ]]; then
+            TELEGRAM_MSG="⚠️ *DEGRADED*: *$TARGET_NAME* \`$TARGET_IP\`
+🕒 Time: \`$NOW\`
+📊 Packet Loss: *${PACKET_LOSS}%*"
+            send_telegram "$TELEGRAM_MSG"
+            echo "DEGRADED $NOW_TS $PACKET_LOSS" > "$STATUS_FILE"
+        else
+            # Tetap DEGRADED, update loss tapi jaga timestamp DEGRADED pertama
+            echo "DEGRADED $PREV_TIMESTAMP $PACKET_LOSS" > "$STATUS_FILE"
+        fi
+
+    elif [[ "$CURRENT_STATE" == "UP" ]]; then
+        echo "[$NOW] $TARGET_NAME ($TARGET_IP) is UP" >> "$LOG_DIR/uptime.log"
+
+        if [[ "$PREV_STATE" == "DOWN" || "$PREV_STATE" == "DEGRADED" ]]; then
+            DURATION_SEC=$(( NOW_TS - PREV_TIMESTAMP ))
+            DURATION_STR="$((DURATION_SEC / 60))m $((DURATION_SEC % 60))s"
+            LAST_LOSS="${PREV_LOSS}%"
+            [[ "$PREV_STATE" == "DOWN" ]] && LAST_LOSS="100% (DOWN)"
+
+            TELEGRAM_MSG="✅ *RECOVERED*: *$TARGET_NAME* \`$TARGET_IP\` is *UP* again
+🕒 Time: \`$NOW\`
+⏱ Duration: $DURATION_STR
+📊 last loss was $LAST_LOSS"
+            send_telegram "$TELEGRAM_MSG"
+        fi
+        echo "UP" > "$STATUS_FILE"
+    fi
+done
+
+if [[ "$(date +%u)" == "7" && "$(date +%H)" == "03" ]]; then
+    cleanup_logs
+fi
